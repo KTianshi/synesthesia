@@ -35,19 +35,17 @@ def choose_device() -> str:
 
 
 def load_pipeline(model_id: str, device: str):
-    """Load a Stable Diffusion pipeline from Hugging Face."""
-    from diffusers import StableDiffusionPipeline
+    """Load a compatible text-to-image diffusion pipeline from Hugging Face."""
+    from diffusers import AutoPipelineForText2Image
 
     load_dotenv()
     token = os.getenv("HF_TOKEN")
     torch_dtype = torch.float16 if device == "cuda" else torch.float32
 
-    pipe = StableDiffusionPipeline.from_pretrained(
+    pipe = AutoPipelineForText2Image.from_pretrained(
         model_id,
         token=token,
         torch_dtype=torch_dtype,
-        safety_checker=None,
-        requires_safety_checker=False,
     )
     pipe = pipe.to(device)
     pipe.enable_attention_slicing()
