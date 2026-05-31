@@ -26,6 +26,9 @@ DEFAULT_MODES = (
     "latent_dropout",
     "weight_noise",
     "weight_dropout",
+    "activation_roll",
+    "activation_shuffle",
+    "activation_noise",
 )
 
 
@@ -73,6 +76,9 @@ def mode_settings(mode: str) -> dict[str, Any]:
         "latent_dropout": {"num_inference_steps": 30, "guidance_scale": 7.5},
         "weight_noise": {"num_inference_steps": 30, "guidance_scale": 7.5},
         "weight_dropout": {"num_inference_steps": 30, "guidance_scale": 7.5},
+        "activation_roll": {"num_inference_steps": 30, "guidance_scale": 7.5},
+        "activation_shuffle": {"num_inference_steps": 30, "guidance_scale": 7.5},
+        "activation_noise": {"num_inference_steps": 30, "guidance_scale": 7.5},
     }
     if mode not in settings:
         raise ValueError(f"Unknown mode: {mode}")
@@ -116,6 +122,121 @@ def _is_perturbable_weight(name: str, parameter: torch.nn.Parameter) -> bool:
         return False
     target_terms = ("attn", "to_q", "to_k", "to_v", "to_out", "proj", "ff", "mlp")
     return any(term in name.lower() for term in target_terms)
+
+
+def _is_block_module(name: str, module: torch.nn.Module) -> bool:
+    """Select whole denoiser blocks rather than tiny inner layers."""
+    del module
+    return bool(
+        re.search(r"(?:^|\.)transformer_blocks\.\d+$", name)
+        or re.search(r"(?:^|\.)single_transformer_blocks\.\d+$", name)
+        or re.search(r"(?:^|\.)down_blocks\.\d+$", name)
+        or re.search(r"(?:^|\.)mid_block$", name)
+        or re.search(r"(?:^|\.)up_blocks\.\d+$", name)
+    )
+
+
+def _perturb_activation_tensor(
+    tensor: torch.Tensor,
+    mode: str,
+    generator: torch.Generator,
+    strength: float,
+) -> torch.Tensor:
+    """Apply a structural activation perturbation while preserving tensor shape."""
+    if not torch.is_floating_point(tensor) or tensor.ndim < 3:
+        return tensor
+
+    if mode == "activation_noise":
+        scale = tensor.detach().float().std().to(tensor.dtype)
+        if not torch.isfinite(scale) or float(scale) == 0.0:
+            scale = torch.tensor(1.0, device=tensor.device, dtype=tensor.dtype)
+        noise = torch.randn(tensor.shape, generator=generator, device=tensor.device, dtype=tensor.dtype)
+        return tensor + noise * scale * strength
+
+    if tensor.ndim == 3:
+        # Transformer token sequence: [batch, tokens, channels].
+        token_dim = 1
+    else:
+        # U-Net feature map: perturb width first, preserving channels.
+        token_dim = -1
+
+    if mode == "activation_roll":
+        shift = max(1, int(tensor.shape[token_dim] * strength))
+        rolled = torch.roll(tensor, shifts=shift, dims=token_dim)
+        return tensor.lerp(rolled, min(1.0, strength * 2.0))
+
+    if mode == "activation_shuffle":
+        index = torch.randperm(tensor.shape[token_dim], generator=generator, device=tensor.device)
+        shuffled = tensor.index_select(token_dim, index)
+        return tensor.lerp(shuffled, min(1.0, strength))
+
+    return tensor
+
+
+def _map_activation_output(
+    output,
+    mode: str,
+    generator: torch.Generator,
+    strength: float,
+):
+    if isinstance(output, torch.Tensor):
+        return _perturb_activation_tensor(output, mode, generator, strength)
+    if isinstance(output, tuple):
+        return tuple(
+            _perturb_activation_tensor(item, mode, generator, strength)
+            if isinstance(item, torch.Tensor)
+            else item
+            for item in output
+        )
+    if isinstance(output, list):
+        return [
+            _perturb_activation_tensor(item, mode, generator, strength)
+            if isinstance(item, torch.Tensor)
+            else item
+            for item in output
+        ]
+    return output
+
+
+@contextmanager
+def temporary_activation_perturbation(
+    pipe,
+    mode: str,
+    seed: int,
+    strength: float,
+    max_blocks: int,
+):
+    """Temporarily perturb hidden activations in selected denoiser blocks."""
+    if mode not in {"activation_roll", "activation_shuffle", "activation_noise"}:
+        yield []
+        return
+
+    denoiser = get_denoiser(pipe)
+    blocks = [
+        (name, module)
+        for name, module in denoiser.named_modules()
+        if _is_block_module(name, module)
+    ]
+    if not blocks:
+        yield []
+        return
+
+    # Choose middle blocks because they tend to affect scene structure more than texture-only details.
+    start = max(0, (len(blocks) - max_blocks) // 2)
+    selected = blocks[start : start + max_blocks]
+    generator = torch.Generator(device=pipe.device.type).manual_seed(seed)
+    handles = []
+
+    def hook(_module, _inputs, output):
+        return _map_activation_output(output, mode, generator, strength)
+
+    try:
+        for _, module in selected:
+            handles.append(module.register_forward_hook(hook))
+        yield [name for name, _ in selected]
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 @contextmanager
@@ -191,6 +312,8 @@ def generate_variant(
     weight_noise_scale: float = 0.02,
     weight_dropout_rate: float = 0.02,
     weight_max_tensors: int = 8,
+    activation_strength: float = 0.35,
+    activation_max_blocks: int = 8,
 ) -> dict[str, Any]:
     """Generate and save one prompt under one degradation condition."""
     settings = mode_settings(mode)
@@ -221,10 +344,22 @@ def generate_variant(
         if mode in {"weight_noise", "weight_dropout"}
         else nullcontext([])
     )
+    activation_context = (
+        temporary_activation_perturbation(
+            pipe=pipe,
+            mode=mode,
+            seed=seed,
+            strength=activation_strength,
+            max_blocks=activation_max_blocks,
+        )
+        if mode in {"activation_roll", "activation_shuffle", "activation_noise"}
+        else nullcontext([])
+    )
 
     with perturbation_context as perturbed_weights:
-        with torch.inference_mode():
-            image = pipe(**kwargs).images[0]
+        with activation_context as perturbed_activations:
+            with torch.inference_mode():
+                image = pipe(**kwargs).images[0]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path)
 
@@ -241,6 +376,10 @@ def generate_variant(
         "weight_noise_scale": weight_noise_scale if mode == "weight_noise" else None,
         "weight_dropout_rate": weight_dropout_rate if mode == "weight_dropout" else None,
         "perturbed_weights": perturbed_weights,
+        "activation_strength": activation_strength
+        if mode in {"activation_roll", "activation_shuffle", "activation_noise"}
+        else None,
+        "perturbed_activations": perturbed_activations,
     }
 
 
@@ -321,6 +460,8 @@ def run_experiment(args: argparse.Namespace) -> Path:
                 weight_noise_scale=args.weight_noise_scale,
                 weight_dropout_rate=args.weight_dropout_rate,
                 weight_max_tensors=args.weight_max_tensors,
+                activation_strength=args.activation_strength,
+                activation_max_blocks=args.activation_max_blocks,
             )
             metadata["results"].append(result)
             image_paths.append(image_path)
@@ -351,6 +492,8 @@ def main() -> None:
     parser.add_argument("--weight-noise-scale", type=float, default=0.02)
     parser.add_argument("--weight-dropout-rate", type=float, default=0.02)
     parser.add_argument("--weight-max-tensors", type=int, default=8)
+    parser.add_argument("--activation-strength", type=float, default=0.35)
+    parser.add_argument("--activation-max-blocks", type=int, default=8)
     parser.add_argument("--modes", nargs="+", choices=DEFAULT_MODES, default=None)
     args = parser.parse_args()
 
