@@ -235,4 +235,16 @@ def main() -> None:
     parser.add_argument("--model-id", default=None, help="Hugging Face model id.")
     parser.add_argument("--device", choices=["cuda", "mps", "cpu"], default=None)
     parser.add_argument("--seed", type=int, default=153)
-    parser.add_argument("--height", type=int, defau
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--noise-scale", type=float, default=0.08)
+    parser.add_argument("--dropout-rate", type=float, default=0.08)
+    parser.add_argument("--modes", nargs="+", choices=DEFAULT_MODES, default=None)
+    args = parser.parse_args()
+
+    output_dir = run_experiment(args)
+    print(f"Saved experiment outputs to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
