@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import json
 import os
 import re
@@ -16,7 +17,16 @@ from PIL import Image, ImageDraw
 
 
 DEFAULT_MODEL_ID = "runwayml/stable-diffusion-v1-5"
-DEFAULT_MODES = ("baseline", "low_steps", "low_guidance", "high_guidance", "latent_noise", "latent_dropout")
+DEFAULT_MODES = (
+    "baseline",
+    "low_steps",
+    "low_guidance",
+    "high_guidance",
+    "latent_noise",
+    "latent_dropout",
+    "weight_noise",
+    "weight_dropout",
+)
 
 
 def slugify(text: str, max_length: int = 64) -> str:
@@ -61,6 +71,8 @@ def mode_settings(mode: str) -> dict[str, Any]:
         "high_guidance": {"num_inference_steps": 30, "guidance_scale": 15.0},
         "latent_noise": {"num_inference_steps": 30, "guidance_scale": 7.5},
         "latent_dropout": {"num_inference_steps": 30, "guidance_scale": 7.5},
+        "weight_noise": {"num_inference_steps": 30, "guidance_scale": 7.5},
+        "weight_dropout": {"num_inference_steps": 30, "guidance_scale": 7.5},
     }
     if mode not in settings:
         raise ValueError(f"Unknown mode: {mode}")
@@ -90,6 +102,82 @@ def degradation_callback(mode: str, noise_scale: float, dropout_rate: float) -> 
     return callback
 
 
+def get_denoiser(pipe) -> torch.nn.Module:
+    """Return the main denoising network for SD, SDXL, or FLUX-style pipelines."""
+    if hasattr(pipe, "transformer"):
+        return pipe.transformer
+    if hasattr(pipe, "unet"):
+        return pipe.unet
+    raise ValueError("Pipeline does not expose a transformer or unet denoiser.")
+
+
+def _is_perturbable_weight(name: str, parameter: torch.nn.Parameter) -> bool:
+    if parameter.ndim < 2 or not torch.is_floating_point(parameter):
+        return False
+    target_terms = ("attn", "to_q", "to_k", "to_v", "to_out", "proj", "ff", "mlp")
+    return any(term in name.lower() for term in target_terms)
+
+
+@contextmanager
+def temporary_weight_perturbation(
+    pipe,
+    mode: str,
+    seed: int,
+    noise_scale: float,
+    dropout_rate: float,
+    max_tensors: int,
+):
+    """Temporarily perturb a small subset of denoiser weights, then restore them."""
+    if mode not in {"weight_noise", "weight_dropout"}:
+        yield []
+        return
+
+    denoiser = get_denoiser(pipe)
+    generator = torch.Generator(device=pipe.device.type).manual_seed(seed)
+    candidates = [
+        (name, parameter)
+        for name, parameter in denoiser.named_parameters()
+        if _is_perturbable_weight(name, parameter)
+    ]
+    if not candidates:
+        yield []
+        return
+
+    # Spread perturbations across the denoiser instead of only hitting early layers.
+    stride = max(1, len(candidates) // max_tensors)
+    selected = candidates[::stride][:max_tensors]
+    originals = [(parameter, parameter.detach().clone()) for _, parameter in selected]
+    changed_names = [name for name, _ in selected]
+
+    try:
+        with torch.no_grad():
+            for _, parameter in selected:
+                if mode == "weight_noise":
+                    scale = parameter.detach().float().std().to(parameter.dtype)
+                    if not torch.isfinite(scale) or float(scale) == 0.0:
+                        scale = torch.tensor(1.0, device=parameter.device, dtype=parameter.dtype)
+                    noise = torch.randn(
+                        parameter.shape,
+                        generator=generator,
+                        device=parameter.device,
+                        dtype=parameter.dtype,
+                    )
+                    parameter.add_(noise * scale * noise_scale)
+                elif mode == "weight_dropout":
+                    mask = torch.rand(
+                        parameter.shape,
+                        generator=generator,
+                        device=parameter.device,
+                        dtype=parameter.dtype,
+                    ) > dropout_rate
+                    parameter.mul_(mask)
+        yield changed_names
+    finally:
+        with torch.no_grad():
+            for parameter, original in originals:
+                parameter.copy_(original)
+
+
 def generate_variant(
     pipe,
     prompt: str,
@@ -100,6 +188,9 @@ def generate_variant(
     width: int,
     noise_scale: float = 0.08,
     dropout_rate: float = 0.08,
+    weight_noise_scale: float = 0.02,
+    weight_dropout_rate: float = 0.02,
+    weight_max_tensors: int = 8,
 ) -> dict[str, Any]:
     """Generate and save one prompt under one degradation condition."""
     settings = mode_settings(mode)
@@ -118,8 +209,22 @@ def generate_variant(
         kwargs["callback_on_step_end"] = callback
         kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
 
-    with torch.inference_mode():
-        image = pipe(**kwargs).images[0]
+    perturbation_context = (
+        temporary_weight_perturbation(
+            pipe=pipe,
+            mode=mode,
+            seed=seed,
+            noise_scale=weight_noise_scale,
+            dropout_rate=weight_dropout_rate,
+            max_tensors=weight_max_tensors,
+        )
+        if mode in {"weight_noise", "weight_dropout"}
+        else nullcontext([])
+    )
+
+    with perturbation_context as perturbed_weights:
+        with torch.inference_mode():
+            image = pipe(**kwargs).images[0]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path)
 
@@ -133,6 +238,9 @@ def generate_variant(
         "width": width,
         "noise_scale": noise_scale if mode == "latent_noise" else None,
         "dropout_rate": dropout_rate if mode == "latent_dropout" else None,
+        "weight_noise_scale": weight_noise_scale if mode == "weight_noise" else None,
+        "weight_dropout_rate": weight_dropout_rate if mode == "weight_dropout" else None,
+        "perturbed_weights": perturbed_weights,
     }
 
 
@@ -210,6 +318,9 @@ def run_experiment(args: argparse.Namespace) -> Path:
                 width=args.width,
                 noise_scale=args.noise_scale,
                 dropout_rate=args.dropout_rate,
+                weight_noise_scale=args.weight_noise_scale,
+                weight_dropout_rate=args.weight_dropout_rate,
+                weight_max_tensors=args.weight_max_tensors,
             )
             metadata["results"].append(result)
             image_paths.append(image_path)
@@ -237,6 +348,9 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--noise-scale", type=float, default=0.08)
     parser.add_argument("--dropout-rate", type=float, default=0.08)
+    parser.add_argument("--weight-noise-scale", type=float, default=0.02)
+    parser.add_argument("--weight-dropout-rate", type=float, default=0.02)
+    parser.add_argument("--weight-max-tensors", type=int, default=8)
     parser.add_argument("--modes", nargs="+", choices=DEFAULT_MODES, default=None)
     args = parser.parse_args()
 
